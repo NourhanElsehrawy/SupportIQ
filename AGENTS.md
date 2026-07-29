@@ -11,6 +11,9 @@ roadmap components before their milestone is explicitly approved.
 
 ## Working approach
 
+- Keep answers concise, direct, and focused on the current decision or task.
+- Avoid long explanations unless they are necessary for understanding or the
+  user explicitly requests more detail.
 - Inspect relevant code, configuration, infrastructure, tests, and documentation
   before proposing a change.
 - Explain the relevant concepts, request flow, design choices, and reasonable
@@ -18,6 +21,10 @@ roadmap components before their milestone is explicitly approved.
 - Work on one small, reviewable milestone at a time.
 - State which files will change and why before editing.
 - Prefer simple, explicit, production-quality code over clever abstractions.
+- Do not overengineer. Add only the components and abstractions required by the
+  current approved milestone.
+- Do not design for hypothetical future requirements when a smaller,
+  maintainable implementation satisfies the current need.
 - Preserve working functionality unless its removal is explained and approved.
 - Do not proceed to the next milestone without explicit user approval.
 
