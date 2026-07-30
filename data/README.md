@@ -39,6 +39,15 @@ Every external source must be documented with:
 
 ## Evaluation data
 
-Future evaluation records will live under `data/evaluation/`. They will map
-customer questions to expected `document_id` values so retrieval accuracy can
-be measured independently from answer generation.
+Evaluation records live in `data/evaluation/rag_questions.jsonl`. Each line is
+one JSON object containing:
+
+- `question_id`: stable evaluation-case identifier;
+- `question`: customer wording presented to the RAG system;
+- `question_type`: direct, paraphrased, multi-document, or unanswerable;
+- `expected_source_ids`: documents retrieval should find;
+- `expected_answer_facts`: facts a grounded answer should include;
+- `answerable`: whether the current knowledge base contains enough evidence.
+
+These records measure retrieval independently from answer generation. They
+must not be included in the searchable knowledge base.
