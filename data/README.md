@@ -51,3 +51,8 @@ one JSON object containing:
 
 These records measure retrieval independently from answer generation. They
 must not be included in the searchable knowledge base.
+
+For direct and paraphrased questions, the expected source is the primary
+document that contains the answer. For multi-document questions, every value in
+`expected_source_ids` is required because each document contributes a distinct
+fact.
