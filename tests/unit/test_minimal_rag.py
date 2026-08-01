@@ -6,12 +6,24 @@ import pytest
 from experiments.minimal_rag import (
     DEFAULT_KNOWLEDGE_BASE,
     DEFAULT_MAX_CHARACTERS,
+    INSUFFICIENT_EVIDENCE_RESPONSE,
+    OllamaPayload,
+    OllamaResponse,
+    RetrievalResult,
+    SupportChunk,
     SupportDocument,
+    build_grounded_context,
     chunk_document,
+    cosine_similarity,
+    embed_texts,
+    extract_citations,
+    generate_grounded_answer,
     load_documents,
     parse_document,
+    retrieve_chunks,
     split_body,
     split_long_paragraph,
+    validate_answer_citations,
 )
 
 DOCUMENT_TEMPLATE = """---
@@ -42,6 +54,25 @@ def write_document(
             content=content,
         ),
         encoding="utf-8",
+    )
+
+
+def make_chunk(
+    document_id: str,
+    *,
+    position: int = 0,
+    content: str = "# Policy\n\nPolicy content.",
+) -> SupportChunk:
+    return SupportChunk(
+        chunk_id=f"{document_id}::chunk-{position:03d}",
+        document_id=document_id,
+        document_title="Policy",
+        position=position,
+        heading="Policy",
+        heading_level=1,
+        parent_headings=(),
+        source_path=Path(f"{document_id}.md"),
+        content=content,
     )
 
 
@@ -193,3 +224,111 @@ def test_chunk_document_rejects_heading_larger_than_limit() -> None:
 
     with pytest.raises(ValueError, match="Heading hierarchy exceeds"):
         chunk_document(document, max_characters=10)
+
+
+def test_embed_texts_returns_numeric_vectors_from_ollama() -> None:
+    captured_payload: OllamaPayload = {}
+
+    def fake_post(endpoint: str, payload: OllamaPayload) -> OllamaResponse:
+        assert endpoint == "/api/embed"
+        captured_payload.update(payload)
+        return {"embeddings": [[1, 0.5], [0, -1]]}
+
+    embeddings = embed_texts(["first", "second"], ollama_post=fake_post)
+
+    assert embeddings == [[1.0, 0.5], [0.0, -1.0]]
+    assert captured_payload["model"] == "nomic-embed-text"
+    assert captured_payload["input"] == ["first", "second"]
+
+
+def test_embed_texts_rejects_inconsistent_dimensions() -> None:
+    def fake_post(endpoint: str, payload: OllamaPayload) -> OllamaResponse:
+        return {"embeddings": [[1.0, 0.0], [1.0]]}
+
+    with pytest.raises(RuntimeError, match="inconsistent dimensions"):
+        embed_texts(["first", "second"], ollama_post=fake_post)
+
+
+def test_cosine_similarity_for_identical_and_orthogonal_vectors() -> None:
+    assert cosine_similarity([1.0, 1.0], [1.0, 1.0]) == pytest.approx(1.0)
+    assert cosine_similarity([1.0, 0.0], [0.0, 1.0]) == pytest.approx(0.0)
+
+
+def test_cosine_similarity_rejects_zero_vector() -> None:
+    with pytest.raises(ValueError, match="zero-magnitude"):
+        cosine_similarity([0.0, 0.0], [1.0, 0.0])
+
+
+def test_retrieve_chunks_returns_highest_scores_first() -> None:
+    chunks = [make_chunk("first"), make_chunk("second"), make_chunk("third")]
+    chunk_embeddings = [[1.0, 0.0], [0.8, 0.2], [0.0, 1.0]]
+
+    def fake_embed(texts: list[str]) -> list[list[float]]:
+        assert texts == ["Which policy is relevant?"]
+        return [[1.0, 0.0]]
+
+    results = retrieve_chunks(
+        "Which policy is relevant?",
+        chunks,
+        chunk_embeddings,
+        embed=fake_embed,
+        top_k=2,
+    )
+
+    assert [result.chunk.document_id for result in results] == ["first", "second"]
+    assert results[0].score == pytest.approx(1.0)
+    assert results[0].score >= results[1].score
+
+
+def test_retrieve_chunks_requires_one_embedding_per_chunk() -> None:
+    with pytest.raises(ValueError, match="Every chunk"):
+        retrieve_chunks("Question", [make_chunk("first")], [])
+
+
+def test_grounded_context_exposes_document_ids_but_not_chunk_ids() -> None:
+    chunk = make_chunk("account-policy", content="# Account\n\nSupported fact.")
+    context = build_grounded_context(
+        "What is supported?",
+        [RetrievalResult(chunk=chunk, score=0.9)],
+    )
+
+    assert "DOCUMENT_ID: account-policy" in context
+    assert "account-policy::chunk-000" not in context
+    assert "Supported fact." in context
+
+
+def test_extract_citations_returns_unique_document_ids() -> None:
+    answer = "First fact [account-policy]. Second fact [billing-policy] [account-policy]."
+
+    assert extract_citations(answer) == {"account-policy", "billing-policy"}
+
+
+def test_validate_answer_citations_rejects_unretrieved_source() -> None:
+    results = [RetrievalResult(chunk=make_chunk("account-policy"), score=0.9)]
+
+    with pytest.raises(ValueError, match="outside retrieved context"):
+        validate_answer_citations("Unsupported claim [invented-policy].", results)
+
+
+def test_validate_answer_citations_accepts_clean_abstention() -> None:
+    validate_answer_citations(INSUFFICIENT_EVIDENCE_RESPONSE, [])
+
+
+def test_generate_grounded_answer_uses_chat_and_validates_citation() -> None:
+    results = [RetrievalResult(chunk=make_chunk("account-policy"), score=0.9)]
+    captured_payload: OllamaPayload = {}
+
+    def fake_post(endpoint: str, payload: OllamaPayload) -> OllamaResponse:
+        assert endpoint == "/api/chat"
+        captured_payload.update(payload)
+        return {"message": {"content": "Supported answer [account-policy]."}}
+
+    answer = generate_grounded_answer(
+        "What is supported?",
+        results,
+        ollama_post=fake_post,
+    )
+
+    assert answer == "Supported answer [account-policy]."
+    assert captured_payload["model"] == "llama3.2:3b"
+    assert captured_payload["stream"] is False

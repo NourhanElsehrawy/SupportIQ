@@ -1,10 +1,20 @@
+import json
+import math
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
 DEFAULT_KNOWLEDGE_BASE = Path("data/sample_knowledge_base")
 DEFAULT_MAX_CHARACTERS = 800
+DEFAULT_TOP_K = 3
+OLLAMA_BASE_URL = "http://localhost:11434"
+EMBEDDING_MODEL = "nomic-embed-text"
+GENERATION_MODEL = "llama3.2:3b"
+INSUFFICIENT_EVIDENCE_RESPONSE = "Insufficient evidence in the SupportIQ knowledge base."
 REQUIRED_METADATA = {
     "document_id",
     "title",
@@ -42,7 +52,22 @@ class SupportChunk:
     content: str
 
 
+@dataclass(frozen=True)
+class RetrievalResult:
+    """A support chunk and its semantic similarity to a question."""
+
+    chunk: SupportChunk
+    score: float
+
+
+OllamaResponse = dict[str, object]
+OllamaPayload = dict[str, object]
+OllamaPost = Callable[[str, OllamaPayload], OllamaResponse]
+EmbedTexts = Callable[[list[str]], list[list[float]]]
+
+
 HEADING_PATTERN = re.compile(r"^(#{1,6})\s+(.+)$")
+CITATION_PATTERN = re.compile(r"\[([^]\n]+)\]")
 
 
 def parse_document(path: Path) -> SupportDocument:
@@ -233,16 +258,211 @@ def chunk_document(
     return chunks
 
 
+def post_ollama(
+    endpoint: str,
+    payload: OllamaPayload,
+    *,
+    base_url: str = OLLAMA_BASE_URL,
+) -> OllamaResponse:
+    """Send one JSON request to the local Ollama HTTP API."""
+    request = Request(
+        f"{base_url}{endpoint}",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+
+    try:
+        with urlopen(request, timeout=300) as response:  # noqa: S310
+            decoded: object = json.loads(response.read().decode("utf-8"))
+    except HTTPError as exc:
+        details = exc.read().decode("utf-8")
+        raise RuntimeError(f"Ollama rejected the request: {details}") from exc
+    except URLError as exc:
+        raise RuntimeError("Ollama is not reachable. Start Ollama and try again.") from exc
+
+    if not isinstance(decoded, dict) or not all(isinstance(key, str) for key in decoded):
+        raise RuntimeError("Ollama returned an invalid JSON response")
+
+    return decoded
+
+
+def embed_texts(
+    texts: list[str],
+    *,
+    ollama_post: OllamaPost = post_ollama,
+) -> list[list[float]]:
+    """Create local embeddings with the configured Ollama model."""
+    if not texts or any(not text.strip() for text in texts):
+        raise ValueError("Embedding input must contain non-empty text")
+
+    response = ollama_post(
+        "/api/embed",
+        {"model": EMBEDDING_MODEL, "input": texts},
+    )
+    raw_embeddings = response.get("embeddings")
+    if not isinstance(raw_embeddings, list) or len(raw_embeddings) != len(texts):
+        raise RuntimeError("Ollama returned an invalid number of embeddings")
+
+    embeddings: list[list[float]] = []
+    for raw_embedding in raw_embeddings:
+        if not isinstance(raw_embedding, list) or not raw_embedding:
+            raise RuntimeError("Ollama returned an invalid embedding")
+        if any(
+            not isinstance(value, int | float) or isinstance(value, bool) for value in raw_embedding
+        ):
+            raise RuntimeError("Ollama returned a non-numeric embedding value")
+        embeddings.append([float(value) for value in raw_embedding])
+
+    dimensions = {len(embedding) for embedding in embeddings}
+    if len(dimensions) != 1:
+        raise RuntimeError("Ollama returned embeddings with inconsistent dimensions")
+
+    return embeddings
+
+
+def cosine_similarity(left: list[float], right: list[float]) -> float:
+    """Calculate cosine similarity between equal-length, non-zero vectors."""
+    if len(left) != len(right):
+        raise ValueError("Embedding vectors must have the same dimensions")
+
+    dot_product = sum(a * b for a, b in zip(left, right, strict=True))
+    left_magnitude = math.sqrt(sum(value * value for value in left))
+    right_magnitude = math.sqrt(sum(value * value for value in right))
+    if left_magnitude == 0 or right_magnitude == 0:
+        raise ValueError("Cannot compare a zero-magnitude embedding")
+
+    return dot_product / (left_magnitude * right_magnitude)
+
+
+def retrieve_chunks(
+    question: str,
+    chunks: list[SupportChunk],
+    chunk_embeddings: list[list[float]],
+    *,
+    embed: EmbedTexts = embed_texts,
+    top_k: int = DEFAULT_TOP_K,
+) -> list[RetrievalResult]:
+    """Embed a question and return the most similar chunks in memory."""
+    if not question.strip():
+        raise ValueError("Question must not be empty")
+    if len(chunks) != len(chunk_embeddings):
+        raise ValueError("Every chunk must have one embedding")
+    if top_k <= 0:
+        raise ValueError("top_k must be greater than zero")
+
+    question_embedding = embed([question])[0]
+    ranked = sorted(
+        (
+            RetrievalResult(
+                chunk=chunk,
+                score=cosine_similarity(question_embedding, chunk_embedding),
+            )
+            for chunk, chunk_embedding in zip(chunks, chunk_embeddings, strict=True)
+        ),
+        key=lambda result: result.score,
+        reverse=True,
+    )
+    return ranked[:top_k]
+
+
+def build_grounded_context(question: str, results: list[RetrievalResult]) -> str:
+    """Build the customer question and citable retrieved context for the LLM."""
+    context_blocks = [
+        f"DOCUMENT_ID: {result.chunk.document_id}\nCONTENT:\n{result.chunk.content}"
+        for result in results
+    ]
+    context = "\n\n---\n\n".join(context_blocks)
+    return f"CUSTOMER QUESTION:\n{question}\n\nCONTEXT:\n{context}\n"
+
+
+def extract_citations(answer: str) -> set[str]:
+    """Extract bracketed source identifiers from a generated answer."""
+    return set(CITATION_PATTERN.findall(answer))
+
+
+def validate_answer_citations(answer: str, results: list[RetrievalResult]) -> None:
+    """Reject missing or fabricated citations in a non-abstaining answer."""
+    citations = extract_citations(answer)
+    if answer == INSUFFICIENT_EVIDENCE_RESPONSE:
+        if citations:
+            raise ValueError("An insufficient-evidence response must not contain citations")
+        return
+
+    if not citations:
+        raise ValueError("A grounded answer must contain at least one citation")
+
+    retrieved_document_ids = {result.chunk.document_id for result in results}
+    invalid_citations = citations - retrieved_document_ids
+    if invalid_citations:
+        invalid = ", ".join(sorted(invalid_citations))
+        raise ValueError(f"Answer contains citations outside retrieved context: {invalid}")
+
+
+def generate_grounded_answer(
+    question: str,
+    results: list[RetrievalResult],
+    *,
+    ollama_post: OllamaPost = post_ollama,
+) -> str:
+    """Generate and validate an answer using only retrieved context."""
+    if not results:
+        raise ValueError("At least one retrieval result is required")
+
+    system_message = (
+        "You are a SupportIQ customer-support assistant. "
+        "Use only facts explicitly stated in the supplied context. "
+        "If any passage supports the question, answer with those supported details. "
+        "Explain different account types or conditions when relevant. "
+        "After each supported statement, cite only the value following DOCUMENT_ID "
+        "in square brackets. For example, if the context says DOCUMENT_ID: "
+        "account-policy, write [account-policy]. Do not write "
+        "[DOCUMENT_ID: account-policy]. Never cite headings or invent IDs. "
+        "Only when no passage addresses the question, reply exactly: "
+        f"{INSUFFICIENT_EVIDENCE_RESPONSE}"
+    )
+    response = ollama_post(
+        "/api/chat",
+        {
+            "model": GENERATION_MODEL,
+            "messages": [
+                {"role": "system", "content": system_message},
+                {"role": "user", "content": build_grounded_context(question, results)},
+            ],
+            "stream": False,
+            "options": {"temperature": 0},
+        },
+    )
+
+    raw_message = response.get("message")
+    if not isinstance(raw_message, dict):
+        raise RuntimeError("Ollama returned an invalid chat message")
+    raw_answer = raw_message.get("content")
+    if not isinstance(raw_answer, str) or not raw_answer.strip():
+        raise RuntimeError("Ollama returned an empty answer")
+
+    answer = raw_answer.strip()
+    validate_answer_citations(answer, results)
+    return answer
+
+
 def main() -> None:
     documents = load_documents(DEFAULT_KNOWLEDGE_BASE)
     chunks = [chunk for document in documents for chunk in chunk_document(document)]
+    chunk_embeddings = embed_texts([chunk.content for chunk in chunks])
+    question = "How long is a password-reset link valid?"
+    results = retrieve_chunks(question, chunks, chunk_embeddings)
+    answer = generate_grounded_answer(question, results)
 
-    print(f"Loaded {len(documents)} support documents and created {len(chunks)} chunks:")
-    for document in documents:
+    print(f"Loaded {len(documents)} documents and created {len(chunks)} chunks.")
+    print(f"Embedding model: {EMBEDDING_MODEL}")
+    print(f"Question: {question}")
+    for rank, result in enumerate(results, start=1):
         print(
-            f"- {document.document_id}: {document.title} "
-            f"[{document.product_area}] ({document.source_path})"
+            f"{rank}. {result.chunk.document_id} / {result.chunk.chunk_id} "
+            f"(score={result.score:.4f})"
         )
+    print(f"Answer: {answer}")
 
 
 if __name__ == "__main__":
