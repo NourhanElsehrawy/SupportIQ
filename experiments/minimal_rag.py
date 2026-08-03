@@ -1,0 +1,771 @@
+import argparse
+import json
+import math
+import re
+import statistics
+from collections.abc import Callable
+from dataclasses import dataclass
+from datetime import date
+from pathlib import Path
+from time import perf_counter
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
+
+DEFAULT_KNOWLEDGE_BASE = Path("data/sample_knowledge_base")
+DEFAULT_EVALUATION_DATASET = Path("data/evaluation/rag_questions.jsonl")
+DEFAULT_MAX_CHARACTERS = 800
+DEFAULT_TOP_K = 3
+OLLAMA_BASE_URL = "http://localhost:11434"
+EMBEDDING_MODEL = "nomic-embed-text"
+GENERATION_MODEL = "llama3.2:3b"
+INSUFFICIENT_EVIDENCE_RESPONSE = "Insufficient evidence in the SupportIQ knowledge base."
+REQUIRED_METADATA = {
+    "document_id",
+    "title",
+    "version",
+    "last_updated",
+    "product_area",
+}
+
+
+@dataclass(frozen=True)
+class SupportDocument:
+    """A support document with metadata needed for retrieval and citations."""
+
+    document_id: str
+    title: str
+    version: str
+    last_updated: date
+    product_area: str
+    source_path: Path
+    content: str
+
+
+@dataclass(frozen=True)
+class SupportChunk:
+    """A retrievable section that retains its source-document context."""
+
+    chunk_id: str
+    document_id: str
+    document_title: str
+    position: int
+    heading: str
+    heading_level: int
+    parent_headings: tuple[str, ...]
+    source_path: Path
+    content: str
+
+
+@dataclass(frozen=True)
+class RetrievalResult:
+    """A support chunk and its semantic similarity to a question."""
+
+    chunk: SupportChunk
+    score: float
+
+
+@dataclass(frozen=True)
+class EvaluationQuestion:
+    """One retrieval question with its expected source documents."""
+
+    question_id: str
+    question: str
+    question_type: str
+    expected_source_ids: tuple[str, ...]
+    expected_answer_facts: tuple[str, ...]
+    answerable: bool
+
+
+@dataclass(frozen=True)
+class RetrievalEvaluation:
+    """Ranked evidence, metrics, and latency for one evaluation question."""
+
+    question: EvaluationQuestion
+    results: tuple[RetrievalResult, ...]
+    retrieved_source_ids: tuple[str, ...]
+    hit_at_k: float | None
+    reciprocal_rank_at_k: float | None
+    full_source_coverage: bool | None
+    source_recall_at_k: float | None
+    latency_ms: float
+
+
+@dataclass(frozen=True)
+class RetrievalMetrics:
+    """Aggregate retrieval metrics for a group of questions."""
+
+    question_count: int
+    hit_at_k: float | None
+    mean_reciprocal_rank_at_k: float | None
+    average_latency_ms: float
+
+
+@dataclass(frozen=True)
+class RetrievalSummary:
+    """Overall, per-type, and multi-document retrieval metrics."""
+
+    overall: RetrievalMetrics
+    by_question_type: dict[str, RetrievalMetrics]
+    multi_document_full_coverage_at_k: float | None
+    multi_document_source_recall_at_k: float | None
+
+
+OllamaResponse = dict[str, object]
+OllamaPayload = dict[str, object]
+OllamaPost = Callable[[str, OllamaPayload], OllamaResponse]
+EmbedTexts = Callable[[list[str]], list[list[float]]]
+RetrieveQuestion = Callable[[str], list[RetrievalResult]]
+Clock = Callable[[], float]
+
+
+HEADING_PATTERN = re.compile(r"^(#{1,6})\s+(.+)$")
+CITATION_PATTERN = re.compile(r"\[([^]\n]+)\]")
+
+
+def parse_document(path: Path) -> SupportDocument:
+    """Parse one Markdown document with the experiment's front-matter format."""
+    text = path.read_text(encoding="utf-8")
+    lines = text.splitlines()
+
+    if not lines or lines[0] != "---":
+        raise ValueError(f"{path} must start with a front-matter delimiter")
+
+    try:
+        closing_delimiter = lines.index("---", 1)
+    except ValueError as exc:
+        raise ValueError(f"{path} is missing the closing front-matter delimiter") from exc
+
+    metadata: dict[str, str] = {}
+    for line in lines[1:closing_delimiter]:
+        key, separator, value = line.partition(":")
+        key = key.strip()
+        value = value.strip()
+
+        if not separator or not key or not value:
+            raise ValueError(f"{path} contains invalid metadata: {line!r}")
+        if key in metadata:
+            raise ValueError(f"{path} contains duplicate metadata key: {key}")
+        metadata[key] = value
+
+    missing_fields = REQUIRED_METADATA - metadata.keys()
+    if missing_fields:
+        missing = ", ".join(sorted(missing_fields))
+        raise ValueError(f"{path} is missing required metadata: {missing}")
+
+    content = "\n".join(lines[closing_delimiter + 1 :]).strip()
+    if not content:
+        raise ValueError(f"{path} contains no document content")
+
+    try:
+        last_updated = date.fromisoformat(metadata["last_updated"])
+    except ValueError as exc:
+        raise ValueError(f"{path} has an invalid last_updated date") from exc
+
+    return SupportDocument(
+        document_id=metadata["document_id"],
+        title=metadata["title"],
+        version=metadata["version"],
+        last_updated=last_updated,
+        product_area=metadata["product_area"],
+        source_path=path,
+        content=content,
+    )
+
+
+def load_documents(directory: Path) -> list[SupportDocument]:
+    """Load Markdown documents in deterministic filename order."""
+    if not directory.is_dir():
+        raise ValueError(f"Knowledge-base directory does not exist: {directory}")
+
+    paths = sorted(directory.glob("*.md"))
+    if not paths:
+        raise ValueError(f"Knowledge-base directory contains no Markdown files: {directory}")
+
+    documents = [parse_document(path) for path in paths]
+    document_ids = [document.document_id for document in documents]
+
+    if len(set(document_ids)) != len(document_ids):
+        raise ValueError("Knowledge base contains duplicate document IDs")
+
+    return documents
+
+
+def split_long_paragraph(paragraph: str, max_characters: int) -> list[str]:
+    """Split one oversized paragraph at word boundaries."""
+    pieces: list[str] = []
+    current_words: list[str] = []
+
+    for word in paragraph.split():
+        candidate = " ".join([*current_words, word])
+        if len(candidate) <= max_characters:
+            current_words.append(word)
+            continue
+
+        if not current_words:
+            raise ValueError(f"A word exceeds the {max_characters}-character limit")
+        pieces.append(" ".join(current_words))
+        current_words = [word]
+
+    if current_words:
+        pieces.append(" ".join(current_words))
+
+    return pieces
+
+
+def split_body(body: str, max_characters: int) -> list[str]:
+    """Pack complete paragraphs into pieces within a character limit."""
+    paragraphs = [
+        paragraph.strip() for paragraph in re.split(r"\n\s*\n", body) if paragraph.strip()
+    ]
+    pieces: list[str] = []
+    current_paragraphs: list[str] = []
+
+    for paragraph in paragraphs:
+        if len(paragraph) > max_characters:
+            if current_paragraphs:
+                pieces.append("\n\n".join(current_paragraphs))
+                current_paragraphs = []
+            pieces.extend(split_long_paragraph(paragraph, max_characters))
+            continue
+
+        candidate = "\n\n".join([*current_paragraphs, paragraph])
+        if len(candidate) <= max_characters:
+            current_paragraphs.append(paragraph)
+        else:
+            pieces.append("\n\n".join(current_paragraphs))
+            current_paragraphs = [paragraph]
+
+    if current_paragraphs:
+        pieces.append("\n\n".join(current_paragraphs))
+
+    return pieces
+
+
+def chunk_document(
+    document: SupportDocument,
+    max_characters: int = DEFAULT_MAX_CHARACTERS,
+) -> list[SupportChunk]:
+    """Split a Markdown document by headings while retaining source metadata."""
+    sections: list[tuple[str, int, tuple[str, ...], str]] = []
+    heading_stack: list[tuple[int, str]] = []
+    current_heading: str | None = None
+    current_level: int | None = None
+    current_parents: tuple[str, ...] = ()
+    current_lines: list[str] = []
+
+    def save_current_section() -> None:
+        if current_heading is None or current_level is None:
+            return
+        body = "\n".join(current_lines).strip()
+        if body:
+            sections.append((current_heading, current_level, current_parents, body))
+
+    for line in document.content.splitlines():
+        match = HEADING_PATTERN.match(line)
+        if not match:
+            current_lines.append(line)
+            continue
+
+        save_current_section()
+        level = len(match.group(1))
+        heading = match.group(2).strip()
+        while heading_stack and heading_stack[-1][0] >= level:
+            heading_stack.pop()
+
+        current_heading = heading
+        current_level = level
+        current_parents = tuple(value for _, value in heading_stack)
+        current_lines = []
+        heading_stack.append((level, heading))
+
+    save_current_section()
+
+    chunks: list[SupportChunk] = []
+    for heading, level, parents, body in sections:
+        hierarchy = [*parents, heading]
+        heading_text = "\n".join(
+            f"{'#' * hierarchy_level} {value}"
+            for hierarchy_level, value in enumerate(hierarchy, start=1)
+        )
+        body_limit = max_characters - len(heading_text) - 2
+        if body_limit <= 0:
+            raise ValueError("Heading hierarchy exceeds the chunk-size limit")
+
+        for body_piece in split_body(body, body_limit):
+            position = len(chunks)
+            chunks.append(
+                SupportChunk(
+                    chunk_id=f"{document.document_id}::chunk-{position:03d}",
+                    document_id=document.document_id,
+                    document_title=document.title,
+                    position=position,
+                    heading=heading,
+                    heading_level=level,
+                    parent_headings=parents,
+                    source_path=document.source_path,
+                    content=f"{heading_text}\n\n{body_piece}",
+                )
+            )
+
+    return chunks
+
+
+def post_ollama(
+    endpoint: str,
+    payload: OllamaPayload,
+    *,
+    base_url: str = OLLAMA_BASE_URL,
+) -> OllamaResponse:
+    """Send one JSON request to the local Ollama HTTP API."""
+    request = Request(
+        f"{base_url}{endpoint}",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+
+    try:
+        with urlopen(request, timeout=300) as response:  # noqa: S310
+            decoded: object = json.loads(response.read().decode("utf-8"))
+    except HTTPError as exc:
+        details = exc.read().decode("utf-8")
+        raise RuntimeError(f"Ollama rejected the request: {details}") from exc
+    except URLError as exc:
+        raise RuntimeError("Ollama is not reachable. Start Ollama and try again.") from exc
+
+    if not isinstance(decoded, dict) or not all(isinstance(key, str) for key in decoded):
+        raise RuntimeError("Ollama returned an invalid JSON response")
+
+    return decoded
+
+
+def embed_texts(
+    texts: list[str],
+    *,
+    ollama_post: OllamaPost = post_ollama,
+) -> list[list[float]]:
+    """Create local embeddings with the configured Ollama model."""
+    if not texts or any(not text.strip() for text in texts):
+        raise ValueError("Embedding input must contain non-empty text")
+
+    response = ollama_post(
+        "/api/embed",
+        {"model": EMBEDDING_MODEL, "input": texts},
+    )
+    raw_embeddings = response.get("embeddings")
+    if not isinstance(raw_embeddings, list) or len(raw_embeddings) != len(texts):
+        raise RuntimeError("Ollama returned an invalid number of embeddings")
+
+    embeddings: list[list[float]] = []
+    for raw_embedding in raw_embeddings:
+        if not isinstance(raw_embedding, list) or not raw_embedding:
+            raise RuntimeError("Ollama returned an invalid embedding")
+        if any(
+            not isinstance(value, int | float) or isinstance(value, bool) for value in raw_embedding
+        ):
+            raise RuntimeError("Ollama returned a non-numeric embedding value")
+        embeddings.append([float(value) for value in raw_embedding])
+
+    dimensions = {len(embedding) for embedding in embeddings}
+    if len(dimensions) != 1:
+        raise RuntimeError("Ollama returned embeddings with inconsistent dimensions")
+
+    return embeddings
+
+
+def cosine_similarity(left: list[float], right: list[float]) -> float:
+    """Calculate cosine similarity between equal-length, non-zero vectors."""
+    if len(left) != len(right):
+        raise ValueError("Embedding vectors must have the same dimensions")
+
+    dot_product = sum(a * b for a, b in zip(left, right, strict=True))
+    left_magnitude = math.sqrt(sum(value * value for value in left))
+    right_magnitude = math.sqrt(sum(value * value for value in right))
+    if left_magnitude == 0 or right_magnitude == 0:
+        raise ValueError("Cannot compare a zero-magnitude embedding")
+
+    return dot_product / (left_magnitude * right_magnitude)
+
+
+def retrieve_chunks(
+    question: str,
+    chunks: list[SupportChunk],
+    chunk_embeddings: list[list[float]],
+    *,
+    embed: EmbedTexts = embed_texts,
+    top_k: int = DEFAULT_TOP_K,
+) -> list[RetrievalResult]:
+    """Embed a question and return the most similar chunks in memory."""
+    if not question.strip():
+        raise ValueError("Question must not be empty")
+    if len(chunks) != len(chunk_embeddings):
+        raise ValueError("Every chunk must have one embedding")
+    if top_k <= 0:
+        raise ValueError("top_k must be greater than zero")
+
+    question_embedding = embed([question])[0]
+    ranked = sorted(
+        (
+            RetrievalResult(
+                chunk=chunk,
+                score=cosine_similarity(question_embedding, chunk_embedding),
+            )
+            for chunk, chunk_embedding in zip(chunks, chunk_embeddings, strict=True)
+        ),
+        key=lambda result: result.score,
+        reverse=True,
+    )
+    return ranked[:top_k]
+
+
+def build_grounded_context(question: str, results: list[RetrievalResult]) -> str:
+    """Build the customer question and citable retrieved context for the LLM."""
+    context_blocks = [
+        f"DOCUMENT_ID: {result.chunk.document_id}\nCONTENT:\n{result.chunk.content}"
+        for result in results
+    ]
+    context = "\n\n---\n\n".join(context_blocks)
+    return f"CUSTOMER QUESTION:\n{question}\n\nCONTEXT:\n{context}\n"
+
+
+def extract_citations(answer: str) -> set[str]:
+    """Extract bracketed source identifiers from a generated answer."""
+    return set(CITATION_PATTERN.findall(answer))
+
+
+def validate_answer_citations(answer: str, results: list[RetrievalResult]) -> None:
+    """Reject missing or fabricated citations in a non-abstaining answer."""
+    citations = extract_citations(answer)
+    if answer == INSUFFICIENT_EVIDENCE_RESPONSE:
+        if citations:
+            raise ValueError("An insufficient-evidence response must not contain citations")
+        return
+
+    if not citations:
+        raise ValueError("A grounded answer must contain at least one citation")
+
+    retrieved_document_ids = {result.chunk.document_id for result in results}
+    invalid_citations = citations - retrieved_document_ids
+    if invalid_citations:
+        invalid = ", ".join(sorted(invalid_citations))
+        raise ValueError(f"Answer contains citations outside retrieved context: {invalid}")
+
+
+def generate_grounded_answer(
+    question: str,
+    results: list[RetrievalResult],
+    *,
+    ollama_post: OllamaPost = post_ollama,
+) -> str:
+    """Generate and validate an answer using only retrieved context."""
+    if not results:
+        raise ValueError("At least one retrieval result is required")
+
+    system_message = (
+        "You are a SupportIQ customer-support assistant. "
+        "Use only facts explicitly stated in the supplied context. "
+        "If any passage supports the question, answer with those supported details. "
+        "Explain different account types or conditions when relevant. "
+        "After each supported statement, cite only the value following DOCUMENT_ID "
+        "in square brackets. For example, if the context says DOCUMENT_ID: "
+        "account-policy, write [account-policy]. Do not write "
+        "[DOCUMENT_ID: account-policy]. Never cite headings or invent IDs. "
+        "Only when no passage addresses the question, reply exactly: "
+        f"{INSUFFICIENT_EVIDENCE_RESPONSE}"
+    )
+    response = ollama_post(
+        "/api/chat",
+        {
+            "model": GENERATION_MODEL,
+            "messages": [
+                {"role": "system", "content": system_message},
+                {"role": "user", "content": build_grounded_context(question, results)},
+            ],
+            "stream": False,
+            "options": {"temperature": 0},
+        },
+    )
+
+    raw_message = response.get("message")
+    if not isinstance(raw_message, dict):
+        raise RuntimeError("Ollama returned an invalid chat message")
+    raw_answer = raw_message.get("content")
+    if not isinstance(raw_answer, str) or not raw_answer.strip():
+        raise RuntimeError("Ollama returned an empty answer")
+
+    answer = raw_answer.strip()
+    validate_answer_citations(answer, results)
+    return answer
+
+
+def load_evaluation_questions(path: Path) -> list[EvaluationQuestion]:
+    """Load and validate the retrieval evaluation JSONL dataset."""
+    if not path.is_file():
+        raise ValueError(f"Evaluation dataset does not exist: {path}")
+
+    questions: list[EvaluationQuestion] = []
+    for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+        if not line.strip():
+            continue
+        try:
+            decoded: object = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"Invalid JSON on evaluation line {line_number}") from exc
+        if not isinstance(decoded, dict):
+            raise ValueError(f"Evaluation line {line_number} must contain an object")
+
+        required_fields = {
+            "question_id",
+            "question",
+            "question_type",
+            "expected_source_ids",
+            "expected_answer_facts",
+            "answerable",
+        }
+        missing_fields = required_fields - decoded.keys()
+        if missing_fields:
+            missing = ", ".join(sorted(missing_fields))
+            raise ValueError(f"Evaluation line {line_number} is missing fields: {missing}")
+
+        question_id = decoded["question_id"]
+        question = decoded["question"]
+        question_type = decoded["question_type"]
+        expected_source_ids = decoded["expected_source_ids"]
+        expected_answer_facts = decoded["expected_answer_facts"]
+        answerable = decoded["answerable"]
+
+        if not isinstance(question_id, str) or not question_id.strip():
+            raise ValueError(f"Evaluation line {line_number} has an invalid question_id")
+        if not isinstance(question, str) or not question.strip():
+            raise ValueError(f"Evaluation line {line_number} has an invalid question")
+        if not isinstance(question_type, str) or not question_type.strip():
+            raise ValueError(f"Evaluation line {line_number} has an invalid question_type")
+        if not isinstance(expected_source_ids, list) or not all(
+            isinstance(source_id, str) and source_id for source_id in expected_source_ids
+        ):
+            raise ValueError(f"Evaluation line {line_number} has invalid expected_source_ids")
+        if not isinstance(expected_answer_facts, list) or not all(
+            isinstance(fact, str) and fact for fact in expected_answer_facts
+        ):
+            raise ValueError(f"Evaluation line {line_number} has invalid expected_answer_facts")
+        if not isinstance(answerable, bool):
+            raise ValueError(f"Evaluation line {line_number} has an invalid answerable value")
+        if answerable != bool(expected_source_ids):
+            raise ValueError(
+                f"Evaluation line {line_number} has inconsistent answerable and source values"
+            )
+
+        questions.append(
+            EvaluationQuestion(
+                question_id=question_id,
+                question=question,
+                question_type=question_type,
+                expected_source_ids=tuple(expected_source_ids),
+                expected_answer_facts=tuple(expected_answer_facts),
+                answerable=answerable,
+            )
+        )
+
+    if not questions:
+        raise ValueError(f"Evaluation dataset contains no questions: {path}")
+    question_ids = [question.question_id for question in questions]
+    if len(set(question_ids)) != len(question_ids):
+        raise ValueError("Evaluation dataset contains duplicate question IDs")
+
+    return questions
+
+
+def evaluate_question(
+    question: EvaluationQuestion,
+    retrieve: RetrieveQuestion,
+    *,
+    clock: Clock = perf_counter,
+) -> RetrievalEvaluation:
+    """Retrieve evidence and calculate metrics for one evaluation question."""
+    started = clock()
+    results = retrieve(question.question)
+    latency_ms = (clock() - started) * 1000
+    retrieved_source_ids = tuple(result.chunk.document_id for result in results)
+
+    if not question.answerable:
+        return RetrievalEvaluation(
+            question=question,
+            results=tuple(results),
+            retrieved_source_ids=retrieved_source_ids,
+            hit_at_k=None,
+            reciprocal_rank_at_k=None,
+            full_source_coverage=None,
+            source_recall_at_k=None,
+            latency_ms=latency_ms,
+        )
+
+    expected = set(question.expected_source_ids)
+    retrieved = set(retrieved_source_ids)
+    relevant_ranks = [
+        rank
+        for rank, source_id in enumerate(retrieved_source_ids, start=1)
+        if source_id in expected
+    ]
+
+    return RetrievalEvaluation(
+        question=question,
+        results=tuple(results),
+        retrieved_source_ids=retrieved_source_ids,
+        hit_at_k=float(bool(relevant_ranks)),
+        reciprocal_rank_at_k=1.0 / relevant_ranks[0] if relevant_ranks else 0.0,
+        full_source_coverage=expected <= retrieved,
+        source_recall_at_k=len(expected & retrieved) / len(expected),
+        latency_ms=latency_ms,
+    )
+
+
+def _summarize_group(evaluations: list[RetrievalEvaluation]) -> RetrievalMetrics:
+    answerable = [evaluation for evaluation in evaluations if evaluation.question.answerable]
+    hit_values = [
+        evaluation.hit_at_k for evaluation in answerable if evaluation.hit_at_k is not None
+    ]
+    reciprocal_rank_values = [
+        evaluation.reciprocal_rank_at_k
+        for evaluation in answerable
+        if evaluation.reciprocal_rank_at_k is not None
+    ]
+    return RetrievalMetrics(
+        question_count=len(evaluations),
+        hit_at_k=statistics.mean(hit_values) if hit_values else None,
+        mean_reciprocal_rank_at_k=(
+            statistics.mean(reciprocal_rank_values) if reciprocal_rank_values else None
+        ),
+        average_latency_ms=statistics.mean(evaluation.latency_ms for evaluation in evaluations),
+    )
+
+
+def summarize_retrieval(evaluations: list[RetrievalEvaluation]) -> RetrievalSummary:
+    """Aggregate overall, per-type, and multi-document retrieval metrics."""
+    if not evaluations:
+        raise ValueError("At least one retrieval evaluation is required")
+
+    grouped: dict[str, list[RetrievalEvaluation]] = {}
+    for evaluation in evaluations:
+        grouped.setdefault(evaluation.question.question_type, []).append(evaluation)
+
+    multi_document = grouped.get("multi-document", [])
+    coverage_values = [
+        float(evaluation.full_source_coverage)
+        for evaluation in multi_document
+        if evaluation.full_source_coverage is not None
+    ]
+    source_recall_values = [
+        evaluation.source_recall_at_k
+        for evaluation in multi_document
+        if evaluation.source_recall_at_k is not None
+    ]
+
+    return RetrievalSummary(
+        overall=_summarize_group(evaluations),
+        by_question_type={
+            question_type: _summarize_group(type_evaluations)
+            for question_type, type_evaluations in grouped.items()
+        },
+        multi_document_full_coverage_at_k=(
+            statistics.mean(coverage_values) if coverage_values else None
+        ),
+        multi_document_source_recall_at_k=(
+            statistics.mean(source_recall_values) if source_recall_values else None
+        ),
+    )
+
+
+def build_index() -> tuple[list[SupportDocument], list[SupportChunk], list[list[float]], float]:
+    """Load, chunk, and embed the local knowledge base with measured latency."""
+    documents = load_documents(DEFAULT_KNOWLEDGE_BASE)
+    chunks = [chunk for document in documents for chunk in chunk_document(document)]
+    started = perf_counter()
+    chunk_embeddings = embed_texts([chunk.content for chunk in chunks])
+    embedding_latency_ms = (perf_counter() - started) * 1000
+    return documents, chunks, chunk_embeddings, embedding_latency_ms
+
+
+def run_retrieval_evaluation() -> None:
+    """Run and print retrieval evaluation across the committed dataset."""
+    questions = load_evaluation_questions(DEFAULT_EVALUATION_DATASET)
+    documents, chunks, chunk_embeddings, embedding_latency_ms = build_index()
+
+    def retrieve(question: str) -> list[RetrievalResult]:
+        return retrieve_chunks(question, chunks, chunk_embeddings)
+
+    evaluations = [evaluate_question(question, retrieve) for question in questions]
+    summary = summarize_retrieval(evaluations)
+
+    print(f"Loaded {len(documents)} documents and created {len(chunks)} chunks.")
+    print(f"Processed {len(evaluations)} evaluation questions.")
+    print(f"Chunk embedding latency: {embedding_latency_ms:.2f} ms")
+    print(f"Average retrieval latency: {summary.overall.average_latency_ms:.2f} ms")
+    print(f"Hit@{DEFAULT_TOP_K}: {summary.overall.hit_at_k:.3f}")
+    print(f"MRR@{DEFAULT_TOP_K}: {summary.overall.mean_reciprocal_rank_at_k:.3f}")
+    print(
+        f"Multi-document full coverage@{DEFAULT_TOP_K}: "
+        f"{summary.multi_document_full_coverage_at_k:.3f}"
+    )
+    print(
+        f"Multi-document source recall@{DEFAULT_TOP_K}: "
+        f"{summary.multi_document_source_recall_at_k:.3f}"
+    )
+
+    partial_multi_document = [
+        evaluation
+        for evaluation in evaluations
+        if evaluation.question.question_type == "multi-document"
+        and evaluation.full_source_coverage is False
+    ]
+    for evaluation in partial_multi_document:
+        print(
+            f"Partial retrieval: {evaluation.question.question_id} "
+            f"expected={evaluation.question.expected_source_ids} "
+            f"retrieved={evaluation.retrieved_source_ids}"
+        )
+
+
+def run_grounded_answer_demo() -> None:
+    """Run one end-to-end grounded-answer example with measured latency."""
+    documents, chunks, chunk_embeddings, embedding_latency_ms = build_index()
+    question = "How long is a password-reset link valid?"
+
+    retrieval_started = perf_counter()
+    results = retrieve_chunks(question, chunks, chunk_embeddings)
+    retrieval_latency_ms = (perf_counter() - retrieval_started) * 1000
+
+    generation_started = perf_counter()
+    answer = generate_grounded_answer(question, results)
+    generation_latency_ms = (perf_counter() - generation_started) * 1000
+
+    print(f"Loaded {len(documents)} documents and created {len(chunks)} chunks.")
+    print(f"Embedding model: {EMBEDDING_MODEL}")
+    print(f"Chunk embedding latency: {embedding_latency_ms:.2f} ms")
+    print(f"Retrieval latency: {retrieval_latency_ms:.2f} ms")
+    print(f"Generation latency: {generation_latency_ms:.2f} ms")
+    print(f"Question: {question}")
+    for rank, result in enumerate(results, start=1):
+        print(
+            f"{rank}. {result.chunk.document_id} / {result.chunk.chunk_id} "
+            f"(score={result.score:.4f})"
+        )
+    print(f"Answer: {answer}")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Run the local SupportIQ RAG experiment")
+    parser.add_argument(
+        "--evaluate-retrieval",
+        action="store_true",
+        help="evaluate top-three retrieval across all committed questions",
+    )
+    args = parser.parse_args()
+
+    if args.evaluate_retrieval:
+        run_retrieval_evaluation()
+    else:
+        run_grounded_answer_demo()
+
+
+if __name__ == "__main__":
+    main()
