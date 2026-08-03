@@ -1,12 +1,15 @@
+import json
 from datetime import date
 from pathlib import Path
 
 import pytest
 
 from experiments.minimal_rag import (
+    DEFAULT_EVALUATION_DATASET,
     DEFAULT_KNOWLEDGE_BASE,
     DEFAULT_MAX_CHARACTERS,
     INSUFFICIENT_EVIDENCE_RESPONSE,
+    EvaluationQuestion,
     OllamaPayload,
     OllamaResponse,
     RetrievalResult,
@@ -16,13 +19,16 @@ from experiments.minimal_rag import (
     chunk_document,
     cosine_similarity,
     embed_texts,
+    evaluate_question,
     extract_citations,
     generate_grounded_answer,
     load_documents,
+    load_evaluation_questions,
     parse_document,
     retrieve_chunks,
     split_body,
     split_long_paragraph,
+    summarize_retrieval,
     validate_answer_citations,
 )
 
@@ -332,3 +338,153 @@ def test_generate_grounded_answer_uses_chat_and_validates_citation() -> None:
     assert answer == "Supported answer [account-policy]."
     assert captured_payload["model"] == "llama3.2:3b"
     assert captured_payload["stream"] is False
+
+
+def test_load_evaluation_questions_reads_committed_dataset() -> None:
+    questions = load_evaluation_questions(DEFAULT_EVALUATION_DATASET)
+
+    assert len(questions) == 25
+    assert len({question.question_id for question in questions}) == 25
+    assert sum(question.answerable for question in questions) == 20
+    assert sum(question.question_type == "multi-document" for question in questions) == 5
+
+
+def test_load_evaluation_questions_rejects_inconsistent_answerable_value(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "questions.jsonl"
+    path.write_text(
+        json.dumps(
+            {
+                "question_id": "invalid-001",
+                "question": "Unsupported question?",
+                "question_type": "unanswerable",
+                "expected_source_ids": ["unexpected-source"],
+                "expected_answer_facts": [],
+                "answerable": False,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="inconsistent answerable"):
+        load_evaluation_questions(path)
+
+
+def test_evaluate_question_calculates_rank_and_latency() -> None:
+    question = EvaluationQuestion(
+        question_id="direct-001",
+        question="Which policy applies?",
+        question_type="direct",
+        expected_source_ids=("expected-policy",),
+        expected_answer_facts=("Expected fact.",),
+        answerable=True,
+    )
+    clock_values = iter([10.0, 10.025])
+
+    def retrieve(_: str) -> list[RetrievalResult]:
+        return [
+            RetrievalResult(make_chunk("other-policy"), 0.9),
+            RetrievalResult(make_chunk("expected-policy"), 0.8),
+        ]
+
+    evaluation = evaluate_question(question, retrieve, clock=lambda: next(clock_values))
+
+    assert evaluation.hit_at_k == 1.0
+    assert evaluation.reciprocal_rank_at_k == 0.5
+    assert evaluation.full_source_coverage is True
+    assert evaluation.source_recall_at_k == 1.0
+    assert evaluation.latency_ms == pytest.approx(25.0)
+
+
+def test_evaluate_question_exposes_partial_multi_document_retrieval() -> None:
+    question = EvaluationQuestion(
+        question_id="multi-001",
+        question="Which two policies apply?",
+        question_type="multi-document",
+        expected_source_ids=("first-policy", "second-policy"),
+        expected_answer_facts=("First fact.", "Second fact."),
+        answerable=True,
+    )
+    clock_values = iter([1.0, 1.01])
+
+    evaluation = evaluate_question(
+        question,
+        lambda _: [RetrievalResult(make_chunk("first-policy"), 0.9)],
+        clock=lambda: next(clock_values),
+    )
+
+    assert evaluation.hit_at_k == 1.0
+    assert evaluation.reciprocal_rank_at_k == 1.0
+    assert evaluation.full_source_coverage is False
+    assert evaluation.source_recall_at_k == 0.5
+
+
+def test_evaluate_question_excludes_unanswerable_case_from_relevance_metrics() -> None:
+    question = EvaluationQuestion(
+        question_id="unanswerable-001",
+        question="Unsupported question?",
+        question_type="unanswerable",
+        expected_source_ids=(),
+        expected_answer_facts=(),
+        answerable=False,
+    )
+    clock_values = iter([1.0, 1.02])
+
+    evaluation = evaluate_question(
+        question,
+        lambda _: [RetrievalResult(make_chunk("nearest-policy"), 0.7)],
+        clock=lambda: next(clock_values),
+    )
+
+    assert evaluation.hit_at_k is None
+    assert evaluation.reciprocal_rank_at_k is None
+    assert evaluation.full_source_coverage is None
+    assert evaluation.source_recall_at_k is None
+
+
+def test_summarize_retrieval_reports_multi_document_coverage() -> None:
+    questions = [
+        EvaluationQuestion(
+            question_id="multi-complete",
+            question="Complete?",
+            question_type="multi-document",
+            expected_source_ids=("first", "second"),
+            expected_answer_facts=(),
+            answerable=True,
+        ),
+        EvaluationQuestion(
+            question_id="multi-partial",
+            question="Partial?",
+            question_type="multi-document",
+            expected_source_ids=("first", "second"),
+            expected_answer_facts=(),
+            answerable=True,
+        ),
+    ]
+
+    first_clock = iter([1.0, 1.01])
+    second_clock = iter([2.0, 2.03])
+    evaluations = [
+        evaluate_question(
+            questions[0],
+            lambda _: [
+                RetrievalResult(make_chunk("first"), 0.9),
+                RetrievalResult(make_chunk("second"), 0.8),
+            ],
+            clock=lambda: next(first_clock),
+        ),
+        evaluate_question(
+            questions[1],
+            lambda _: [RetrievalResult(make_chunk("first"), 0.9)],
+            clock=lambda: next(second_clock),
+        ),
+    ]
+
+    summary = summarize_retrieval(evaluations)
+
+    assert summary.overall.hit_at_k == 1.0
+    assert summary.overall.mean_reciprocal_rank_at_k == 1.0
+    assert summary.overall.average_latency_ms == pytest.approx(20.0)
+    assert summary.multi_document_full_coverage_at_k == 0.5
+    assert summary.multi_document_source_recall_at_k == 0.75
